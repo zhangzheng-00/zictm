@@ -8,10 +8,15 @@ const CommonUtils = require('../handlers/CommonUtils');
 // 会计凭证最大行数限制为 999，每行业务数据生成约 2 行会计凭证行项目
 // 因此每批最多处理 490 行业务数据（490 * 2 = 980 < 999）
 const MAX_LINES_PER_DOC = 490;
+
+// 需要将收付款单位替换为 BP 主数据"主体+平台"字段(YY1_FD_ZT_PT_bus)的非资金科目
+const ZT_PT_GL_ACCOUNT = '221020000';
 class AccountingDocumentService {
     constructor() {
         this.zrfcLogid = null;
         this.commonUtils = new CommonUtils();
+        // 收付款单位 -> BP主数据"主体+平台"(YY1_FD_ZT_PT_bus) 的实例级缓存，避免同批重复查询
+        this.ztPtCache = new Map();
     }
 
     async initService(zrfcLogid, zrfcid, canum) {
@@ -244,6 +249,43 @@ class AccountingDocumentService {
         }
     }
 
+    /**
+     * 查询 BP 主数据获取"主体+平台"字段 (YY1_FD_ZT_PT_bus)
+     * @param {string} businessPartner - 业务伙伴/客户编号，如 SCNB000019
+     * @returns {Promise<string|null>} 主体+平台值；查不到或接口失败返回 null
+     */
+    async getZtPtByBusinessPartner(businessPartner) {
+        if (!businessPartner) return null;
+        if (this.ztPtCache.has(businessPartner)) {
+            return this.ztPtCache.get(businessPartner);
+        }
+        let ztPt = null;
+        try {
+            const result = await this.commonUtils.executeHttpRequestWithRetry(
+                { destinationName: this.commonUtils.getDestinationName() },
+                {
+                    method: 'GET',
+                    url: `/sap/opu/odata/sap/API_BUSINESS_PARTNER/A_BusinessPartner?$filter=BusinessPartner eq '${encodeURIComponent(businessPartner)}'&$select=BusinessPartner,YY1_FD_ZT_PT_bus&$format=json`,
+                    headers: {
+                        'Accept': 'application/json',
+                        'Content-Type': 'application/json',
+                        'sap-language': 'ZH'
+                    }
+                }
+            );
+            const entry = result.data && result.data.d && result.data.d.results && result.data.d.results[0];
+            if (entry && entry.YY1_FD_ZT_PT_bus) {
+                ztPt = String(entry.YY1_FD_ZT_PT_bus).trim();
+            }
+            console.log(`[AccountingDocumentService] 获取主体+平台: ${businessPartner} -> ${ztPt || '(未维护/未找到)'}`);
+        } catch (error) {
+            // 查询失败不阻断流程，降级用原收付款单位
+            console.warn('[AccountingDocumentService] 获取主体+平台失败:', error.message);
+        }
+        this.ztPtCache.set(businessPartner, ztPt);
+        return ztPt;
+    }
+
     async buildSoapRequest(businessDataList) {
         // 构建 SOAP 请求体 - 根据 SAP API Business Hub 官方文档格式
         const firstBusinessData = businessDataList[0];
@@ -258,6 +300,23 @@ class AccountingDocumentService {
         let itemNumber = 1; // 统一的行号（客户行和费用行配对使用）
         let debitCreditCode = ''; // 借贷方变量
         let amount = 0; // 金额变量
+
+        // 凭证抬头"参考凭证"(DocumentReferenceID)：
+        // 默认 = 收付款单号；批内任一行非资金科目=221020000 时，
+        // 用该行收付款单位查 BP 主数据"主体+平台"(YY1_FD_ZT_PT_bus) 替换，查不到则降级用单号
+        let documentReferenceId = firstBusinessData.paymentReceiptNo;
+        const ztPtRow = businessDataList.find(
+            item => String(item.generalLedgerAccountNonCash || '') === ZT_PT_GL_ACCOUNT && item.receivingUnit
+        );
+        if (ztPtRow) {
+            const ztPt = await this.getZtPtByBusinessPartner(ztPtRow.receivingUnit);
+            if (ztPt) {
+                documentReferenceId = ztPt;
+                console.log(`[AccountingDocumentService] 科目${ZT_PT_GL_ACCOUNT}：参考凭证替换为"主体+平台" -> ${ztPt}`);
+            } else {
+                console.warn(`[AccountingDocumentService] 科目${ZT_PT_GL_ACCOUNT}：未获取到主体+平台(收付款单位=${ztPtRow.receivingUnit})，参考凭证使用收付款单号`);
+            }
+        }
 
         // 第一次循环
         for (const item of businessDataList) {
@@ -468,7 +527,7 @@ class AccountingDocumentService {
                                 <DocumentDate>${currentDate.toISOString().substring(0, 10)}</DocumentDate>
                                 <PostingDate>${businessDate}</PostingDate>
                                 <ExchangeRateDate>${businessDate}</ExchangeRateDate>
-                                <DocumentReferenceID>${firstBusinessData.paymentReceiptNo}</DocumentReferenceID>
+                                <DocumentReferenceID>${documentReferenceId}</DocumentReferenceID>
                                 ${debtorLines}
                                 ${itemLines}
                             </JournalEntry>
